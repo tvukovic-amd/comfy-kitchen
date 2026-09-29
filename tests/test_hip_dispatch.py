@@ -34,6 +34,30 @@ def _manifest_archs() -> list[str]:
     return [arch for group_name in _HIP_ARCH_GROUP_NAMES for arch in groups[group_name]]
 
 
+@pytest.mark.parametrize("entry", ["hip_attention", "hip_int8_attention"])
+def test_hip_attention_rejects_devices_without_gfx12_wmma(monkeypatch, entry):
+    """gfx11 duplicates WMMA operands; the transposed kernels would compute garbage."""
+    monkeypatch.setattr(hip_backend, "_has_nonduplicated_wmma", lambda device=None: False)
+    q, k, v = (torch.empty(1, 1, 16, 128, dtype=torch.bfloat16) for _ in range(3))
+    assert not hip_backend.hip_attention_is_supported(q, k, v)
+    assert not hip_backend.hip_int8_attention_is_supported(q, k, v)
+    with pytest.raises(RuntimeError, match="gfx12-class"):
+        getattr(hip_backend, entry)(q, k, v)
+
+
+@pytest.mark.parametrize("entry", ["hip_attention", "hip_int8_attention"])
+def test_hip_attention_rejects_inputs_requiring_grad(monkeypatch, entry):
+    monkeypatch.setattr(hip_backend, "_has_nonduplicated_wmma", lambda device=None: True)
+    monkeypatch.setattr(hip_backend, "_attention_device_is_supported", lambda tensor: True)
+    q, k, v = (torch.zeros(1, 1, 128, 128, dtype=torch.bfloat16) for _ in range(3))
+    assert hip_backend.hip_attention_is_supported(q, k, v)
+    q.requires_grad_()
+    assert not hip_backend.hip_attention_is_supported(q, k, v)
+    assert not hip_backend.hip_int8_attention_is_supported(q, k, v)
+    with pytest.raises(RuntimeError, match="forward-only"):
+        getattr(hip_backend, entry)(q, k, v)
+
+
 def test_non_rocm_runtime_does_not_import_hip_backend():
     """A combined wheel must not load the ROCm runtime in CUDA/CPU processes."""
     if getattr(torch.version, "hip", None):

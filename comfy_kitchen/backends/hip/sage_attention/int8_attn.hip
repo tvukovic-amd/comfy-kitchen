@@ -309,7 +309,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
     constexpr bool kPrepared = kPreparedKey || kPreparedDense || kDirectKey;
     constexpr bool kDense = kPreparedDense;
     constexpr bool kCustomMask = kMask != MaskMode::kNone;
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
     constexpr bool kBiasPV = (HD == 128 && (!kCustomMask || kPrepared)) ||
                              (HD == 64 && (kPreparedKey || kDirectKey || kPreparedDense16));
 #else
@@ -561,7 +561,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                 if constexpr (kPreparedDenseBool) {
                     const int64_t tile =
                         static_cast<int64_t>(imin(q_idx, qo_len - 1) / 16) * num_iters + iter;
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
                     keep_bits = dense_bool_mask[tile * 32 + lane];
 #else
                     // gfx11 interleaves even/odd keys between the half-waves.
@@ -573,7 +573,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
 
 #pragma unroll
                 for (int fk = 0; fk < KT; ++fk) {
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
                     const int64_t mask_index = kPreparedDense
                         ? (static_cast<int64_t>(imin(q_idx, qo_len - 1) / 16) * num_iters + iter) * 1024 +
                           fk * 256 + (lane / 16) * 128 + r * 8
@@ -605,7 +605,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
 #endif
 #pragma unroll
                     for (int e = 0; e < 8; ++e) {
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
                         float bias = biases[e];
 #else
                         const int key_row = acc_row(lane, e);
@@ -716,14 +716,14 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
             m_run[fq] = next_m;
 
             typename MmaInt8::Frag p_frag[KT];
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
             uint32_t tile_sum_u32 = 0;
 #else
             float tile_sum = 0.0f;
 #endif
 #pragma unroll
             for (int fk = 0; fk < KT; ++fk) {
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
                 uint32_t packed_lo = 0, packed_hi = 0;
 #else
                 uint32_t packed[8];
@@ -738,7 +738,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                                 : prob[kBoundary ? fk : 0][e] + negative_m)
                             : softmax_exp2(fmaf(static_cast<float>(s_acc[fk][e]),
                                                tile_scale_k[fk], negative_m));
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
                     // Native conversion already rounds to nearest-even and
                     // saturates to U8; a separate rint/clamp is redundant.
                     if (e < 4) {
@@ -751,7 +751,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                     packed[e] = prob_to_u8(p);
 #endif
                 }
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
                 p_frag[fk] =
                     MmaInt8::Frag{static_cast<int>(packed_lo), static_cast<int>(packed_hi)};
                 // Normalize with the same quantized probabilities used by PV.
@@ -762,7 +762,7 @@ __global__ __launch_bounds__((Shape<HD, kMask>::kThreads)) void int8_attn_kernel
                 p_frag[fk] = pack_prob_frag(packed, lane);
 #endif
             }
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
             const float tile_sum = static_cast<float>(tile_sum_u32);
 #endif
             d_run[fq] += tile_sum * tile_scale;

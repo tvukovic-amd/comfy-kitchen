@@ -11,6 +11,8 @@
 #include <hip/hip_runtime.h>
 
 #include <cstdint>
+#include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -306,7 +308,7 @@ __forceinline__ __device__ MmaBf16::Frag pack_prob_frag_bf16(const float p[8], i
 template <typename OutT>
 __forceinline__ __device__ void store_o_tile(OutT* __restrict__ row, int d_base,
                                              const float* vals, int lane) {
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
     // Aligned because the 16-byte store below reinterprets it.
     __attribute__((aligned(16))) OutT packed[8];
 #pragma unroll
@@ -321,11 +323,20 @@ __forceinline__ __device__ void store_o_tile(OutT* __restrict__ row, int d_base,
 #endif
 }
 
+// Balanced pairwise sum of the eight accumulator values a lane holds.
+__forceinline__ __device__ float sum8_balanced(const v8f& value) {
+    const float sum01 = value[0] + value[1];
+    const float sum23 = value[2] + value[3];
+    const float sum45 = value[4] + value[5];
+    const float sum67 = value[6] + value[7];
+    return (sum01 + sum23) + (sum45 + sum67);
+}
+
 // The read side of store_o_tile, for a handover the next kernel resumes from.
 template <typename InT>
 __forceinline__ __device__ void load_o_tile(const InT* __restrict__ row, int d_base, float* vals,
                                             int lane) {
-#if defined(COMFY_MMA_GFX12)
+#if defined(COMFY_MMA_GFX12) || defined(COMFY_MMA_GFX117)
     __attribute__((aligned(16))) InT packed[8];
     *reinterpret_cast<uint4*>(packed) =
         *reinterpret_cast<const uint4*>(row + d_base + 8 * (lane / 16));
@@ -337,6 +348,46 @@ __forceinline__ __device__ void load_o_tile(const InT* __restrict__ row, int d_b
         vals[e] = static_cast<float>(row[d_base + acc_row(lane, e)]);
     }
 #endif
+}
+
+// ---------------------------------------------------------------------------
+// Host-side architecture query
+// ---------------------------------------------------------------------------
+
+// COMFY_MMA_* exist only in device passes, so the host reads gcnArchName
+// (cached per device).
+inline void read_device_arch_name(int device, char (&name)[256]) {
+    hipDeviceProp_t properties{};
+    static_assert(sizeof(properties.gcnArchName) == sizeof(name));
+    if (hipGetDeviceProperties(&properties, device) != hipSuccess) {
+        name[0] = '\0';
+        return;
+    }
+    std::memcpy(name, properties.gcnArchName, sizeof(name));
+    name[sizeof(name) - 1] = '\0';
+}
+
+inline bool current_device_arch_has_prefix(const char* prefix) {
+    constexpr int kMaxDevices = 16;
+    static std::once_flag once[kMaxDevices];
+    static char names[kMaxDevices][256];
+    int device = 0;
+    if (hipGetDevice(&device) != hipSuccess) return false;
+    const size_t length = std::strlen(prefix);
+    if (device < 0 || device >= kMaxDevices) {
+        char name[256];
+        read_device_arch_name(device, name);
+        return std::strncmp(name, prefix, length) == 0;
+    }
+    std::call_once(once[device], [device] { read_device_arch_name(device, names[device]); });
+    return std::strncmp(names[device], prefix, length) == 0;
+}
+
+// gfx12 and gfx117 share the WMMA layout the transposed kernels assume;
+// gfx11 duplicates operands across half-waves.
+inline bool current_device_has_nonduplicated_wmma() {
+    return current_device_arch_has_prefix("gfx12") ||
+           current_device_arch_has_prefix("gfx117");
 }
 
 }  // namespace comfy::hip_backend::sage

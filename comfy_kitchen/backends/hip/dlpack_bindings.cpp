@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -1369,6 +1370,49 @@ static void require_packed_contiguous(const nb::ndarray<>& t, const char* fn, co
     }
 }
 
+static void require_non_overlapping_rows(
+    const nb::ndarray<>& output, int row_axis, uint64_t row_width,
+    const char* fn, const char* name) {
+    struct ActiveDimension {
+        uint64_t extent;
+        uint64_t stride;
+    };
+    ActiveDimension active_dimensions[3]{};
+    int active_count = 0;
+    for (int dim = 0; dim < row_axis; ++dim) {
+        if (output.shape(dim) <= 1) {
+            continue;
+        }
+        if (output.stride(dim) <= 0) {
+            throw std::runtime_error(
+                std::string(fn) + ": " + name + " must have a non-overlapping layout");
+        }
+        ActiveDimension current{
+            static_cast<uint64_t>(output.shape(dim)),
+            static_cast<uint64_t>(output.stride(dim))};
+        int insertion = active_count;
+        while (insertion > 0 &&
+               active_dimensions[insertion - 1].stride > current.stride) {
+            active_dimensions[insertion] = active_dimensions[insertion - 1];
+            --insertion;
+        }
+        active_dimensions[insertion] = current;
+        ++active_count;
+    }
+
+    uint64_t span = row_width;
+    for (int index = 0; index < active_count; ++index) {
+        const auto [extent, stride] = active_dimensions[index];
+        const uint64_t repeats = extent - 1;
+        if (stride < span ||
+            repeats > (std::numeric_limits<uint64_t>::max() - span) / stride) {
+            throw std::runtime_error(
+                std::string(fn) + ": " + name + " must have a non-overlapping layout");
+        }
+        span += repeats * stride;
+    }
+}
+
 static void sage_check_quantized(const nb::ndarray<>& q_int8, const nb::ndarray<>& q_scale,
                                  const nb::ndarray<>& k_int8, const nb::ndarray<>& k_scale,
                                  const nb::ndarray<>& v_int8, const nb::ndarray<>& v_scale,
@@ -1886,6 +1930,217 @@ void flash_attention_decode(nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v,
 }
 
 
+void bf16_sdpa_hip(
+    nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> output,
+    float sm_scale, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "bf16_sdpa_hip";
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 || output.ndim() != 4) {
+        throw std::runtime_error(std::string(kFn) + ": q, k, v and output must be 4D");
+    }
+    const int batch = static_cast<int>(q.shape(0));
+    const int q_heads = static_cast<int>(q.shape(1));
+    const int q_len = static_cast<int>(q.shape(2));
+    const int head_dim = static_cast<int>(q.shape(3));
+    const int kv_heads = static_cast<int>(k.shape(1));
+    const int kv_len = static_cast<int>(k.shape(2));
+    if (batch <= 0 || q_heads <= 0 || kv_heads <= 0 || q_heads % kv_heads != 0 ||
+        q_len <= 0 || kv_len <= 0 ||
+        (head_dim != 128) ||
+        k.shape(0) != q.shape(0) || k.shape(3) != q.shape(3) ||
+        v.shape(0) != q.shape(0) || v.shape(1) != k.shape(1) ||
+        v.shape(2) != k.shape(2) || v.shape(3) != q.shape(3) ||
+        output.shape(0) != q.shape(0) || output.shape(1) != q.shape(1) ||
+        output.shape(2) != q.shape(2) || output.shape(3) != q.shape(3)) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": incompatible BF16 [B,H,N,D] tensors or unsupported head dimension");
+    }
+    require_dtype(q, 2, 2, kFn, "q");
+    require_dtype(k, 2, 2, kFn, "k");
+    require_dtype(v, 2, 2, kFn, "v");
+    require_dtype(output, 2, 2, kFn, "output");
+    auto require_supported_layout = [&](const nb::ndarray<>& tensor, const char* name) {
+        if (tensor.stride(3) != 1 || tensor.stride(2) % 8 != 0 ||
+            (tensor.shape(0) > 1 && tensor.stride(0) % 8 != 0) ||
+            (tensor.shape(1) > 1 && tensor.stride(1) % 8 != 0)) {
+            throw std::runtime_error(
+                std::string(kFn) + ": " + name +
+                " must have a contiguous head dimension and 16-byte-aligned rows "
+                "across every batch and head");
+        }
+        if (reinterpret_cast<uintptr_t>(tensor.data()) % 16 != 0) {
+            throw std::runtime_error(
+                std::string(kFn) + ": " + name + " must be 16-byte aligned");
+        }
+    };
+    require_supported_layout(q, "q");
+    require_supported_layout(k, "k");
+    require_supported_layout(v, "v");
+    require_supported_layout(output, "output");
+    require_non_overlapping_rows(output, 3, head_dim, kFn, "output");
+    constexpr int kDeviceRocm = nb::device::rocm::value;
+    const nb::ndarray<>* operands[] = {&q, &k, &v, &output};
+    for (const nb::ndarray<>* operand : operands) {
+        if (operand->device_type() != kDeviceRocm ||
+            operand->device_id() != q.device_id()) {
+            throw std::runtime_error(
+                std::string(kFn) +
+                ": every operand must be ROCm device memory on q's device");
+        }
+    }
+
+    launch_bf16_sdpa_hip(
+        q.data(), k.data(), v.data(), output.data(), batch, q_heads, kv_heads,
+        q_len, kv_len, head_dim,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2),
+        v.stride(0), v.stride(1), v.stride(2),
+        output.stride(0), output.stride(1), output.stride(2), sm_scale,
+        reinterpret_cast<hipStream_t>(stream_ptr));
+    check_hip_launch();
+}
+
+void hip_int8_attention(
+    nb::ndarray<> q, nb::ndarray<> k, nb::ndarray<> v, nb::ndarray<> output,
+    nb::ndarray<> q_int8, nb::ndarray<> k_int8, nb::ndarray<> v_int8,
+    nb::ndarray<> q_descale, nb::ndarray<> k_descale, nb::ndarray<> v_descale,
+    nb::ndarray<> anchor_indices, float sm_scale, uintptr_t stream_ptr) {
+    constexpr const char* kFn = "hip_int8_attention";
+    if (q.ndim() != 4 || k.ndim() != 4 || v.ndim() != 4 ||
+        q.shape(0) != 1 || q.shape(1) == 0 || q.shape(3) != 128 ||
+        k.shape(0) != 1 || k.shape(1) != q.shape(1) || k.shape(3) != 128 ||
+        v.shape(0) != 1 || v.shape(1) != q.shape(1) || v.shape(3) != 128 ||
+        k.shape(2) != v.shape(2)) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": q must be [1, H, Q, 128] and k/v matching [1, H, K, 128]");
+    }
+    const int heads = static_cast<int>(q.shape(1));
+    const int q_len = static_cast<int>(q.shape(2));
+    const int kv_len = static_cast<int>(k.shape(2));
+    if (q_len <= 0 || kv_len <= 0) {
+        throw std::runtime_error(std::string(kFn) + ": Q and K/V lengths must be positive");
+    }
+    require_dtype(q, 1, 2, kFn, "q");
+    require_dtype(k, 1, 2, kFn, "k");
+    require_dtype(v, 1, 2, kFn, "v");
+    const int input_dtype_code = map_dtype_to_code(q.dtype());
+    if (map_dtype_to_code(k.dtype()) != input_dtype_code ||
+        map_dtype_to_code(v.dtype()) != input_dtype_code) {
+        throw std::runtime_error(std::string(kFn) + ": q, k, and v dtypes must match");
+    }
+    if (q.stride(3) != 1 || k.stride(3) != 1 || v.stride(3) != 1) {
+        throw std::runtime_error(std::string(kFn) + ": the head dimension must be contiguous");
+    }
+    // Fail before any launch. Q/K are read in 4-element vectors, V in 16-byte
+    // vectors; an extent of one has no strided offset.
+    const auto aligned = [](const nb::ndarray<>& tensor, size_t bytes) {
+        if (reinterpret_cast<uintptr_t>(tensor.data()) % bytes != 0) return false;
+        for (size_t dim = 1; dim < 3; ++dim) {
+            const int64_t stride = tensor.stride(dim);
+            if (tensor.shape(dim) > 1 &&
+                (stride <= 0 || (static_cast<size_t>(stride) * 2) % bytes != 0)) {
+                return false;
+            }
+        }
+        return true;
+    };
+    if (!aligned(q, 8) || !aligned(k, 8)) {
+        throw std::runtime_error(
+            std::string(kFn) +
+            ": q and k base pointers and H/N strides must preserve 4-element alignment");
+    }
+    if (!aligned(v, 16)) {
+        throw std::runtime_error(
+            std::string(kFn) + ": v base pointer and H/N strides must be 16-byte aligned");
+    }
+    const int padded_k = ((kv_len + 63) / 64) * 64;
+    const int padded_q = ((q_len + 127) / 128) * 128;
+    const int tiles = padded_k / 64;
+    const auto stream = reinterpret_cast<hipStream_t>(stream_ptr);
+
+    if (output.ndim() != 4 || output.shape(0) != 1 ||
+        output.shape(1) != static_cast<size_t>(heads) ||
+        output.shape(2) != static_cast<size_t>(q_len) || output.shape(3) != 128 ||
+        q_int8.ndim() != 4 || q_int8.shape(0) != 1 ||
+        q_int8.shape(1) != static_cast<size_t>(heads) ||
+        q_int8.shape(2) != static_cast<size_t>(q_len) || q_int8.shape(3) != 128 ||
+        k_int8.ndim() != 4 || k_int8.shape(0) != 1 ||
+        k_int8.shape(1) != static_cast<size_t>(heads) ||
+        k_int8.shape(2) != static_cast<size_t>(padded_k) || k_int8.shape(3) != 128 ||
+        v_int8.ndim() != 5 || v_int8.shape(0) != 1 ||
+        v_int8.shape(1) != static_cast<size_t>(heads) ||
+        v_int8.shape(2) != static_cast<size_t>(tiles) || v_int8.shape(3) != 128 ||
+        v_int8.shape(4) != 64) {
+        throw std::runtime_error(std::string(kFn) + ": incompatible packed workspace shapes");
+    }
+    require_dtype(output, 1, 2, kFn, "output");
+    if (map_dtype_to_code(output.dtype()) != input_dtype_code) {
+        throw std::runtime_error(std::string(kFn) + ": output dtype must match q");
+    }
+    require_dtype(q_int8, 4, 4, kFn, "q_int8");
+    require_dtype(k_int8, 4, 4, kFn, "k_int8");
+    require_dtype(v_int8, 4, 4, kFn, "v_int8");
+    require_scale_len(q_descale, static_cast<size_t>(heads) * padded_q,
+                      kFn, "q_descale");
+    require_scale_len(k_descale, static_cast<size_t>(heads) * (padded_k / 16),
+                      kFn, "k_descale");
+    require_scale_len(v_descale, static_cast<size_t>(heads) * tiles * 128,
+                      kFn, "v_descale");
+    if (output.stride(3) != 1) {
+        throw std::runtime_error(
+            std::string(kFn) + ": output head dimension must be contiguous");
+    }
+    if (reinterpret_cast<uintptr_t>(output.data()) % 16 != 0) {
+        throw std::runtime_error(std::string(kFn) + ": output must be 16-byte aligned");
+    }
+    require_non_overlapping_rows(output, 3, 128, kFn, "output");
+    require_packed_contiguous(q_int8, kFn, "q_int8");
+    require_packed_contiguous(k_int8, kFn, "k_int8");
+    require_packed_contiguous(v_int8, kFn, "v_int8");
+    require_packed_contiguous(q_descale, kFn, "q_descale");
+    require_packed_contiguous(k_descale, kFn, "k_descale");
+    require_packed_contiguous(v_descale, kFn, "v_descale");
+    if (anchor_indices.dtype().code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int) ||
+        anchor_indices.dtype().bits != 32 ||
+        anchor_indices.size() < static_cast<size_t>(heads)) {
+        throw std::runtime_error(
+            std::string(kFn) + ": anchor_indices must contain H int32s");
+    }
+    constexpr int kDeviceRocm = nb::device::rocm::value;
+    const nb::ndarray<>* operands[] = {
+        &q,         &k,          &v,          &output,
+        &q_int8,    &k_int8,     &v_int8,     &q_descale,
+        &k_descale, &v_descale,  &anchor_indices,
+    };
+    for (const nb::ndarray<>* operand : operands) {
+        if (operand->device_type() != kDeviceRocm ||
+            operand->device_id() != q.device_id()) {
+            throw std::runtime_error(
+                std::string(kFn) +
+                ": every operand must be ROCm device memory on q's device");
+        }
+    }
+
+    // All four kernels share this stream, so no host sync is needed.
+    launch_gfx12_qk_quant(
+        q.data(), q_int8.data(), q_descale.data(),
+        k.data(), k_int8.data(), k_descale.data(), anchor_indices.data(),
+        heads, q_len, kv_len, padded_q, padded_k,
+        q.stride(0), q.stride(1), q.stride(2),
+        k.stride(0), k.stride(1), k.stride(2), input_dtype_code, stream);
+    launch_gfx12_tile_channel_v_quant(
+        v.data(), v_int8.data(), v_descale.data(), heads, kv_len, tiles,
+        v.stride(1), v.stride(2), input_dtype_code, stream);
+    launch_gfx12_int8_attention(
+        q_int8.data(), k_int8.data(), v_int8.data(), output.data(),
+        q_descale.data(), k_descale.data(), v_descale.data(), heads, q_len,
+        kv_len, padded_q, padded_k, padded_k / 16,
+        output.stride(1), output.stride(2),
+        sm_scale, input_dtype_code, stream);
+    check_hip_launch();
+}
+
 // ---------------------------------------------------------------------------
 // Sol-Attn sparse attention
 // ---------------------------------------------------------------------------
@@ -2356,6 +2611,14 @@ NB_MODULE(_C, m) {
           nb::arg("v_int8"), nb::arg("o"), nb::arg("q_scale"), nb::arg("k_scale"),
           nb::arg("v_scale"), nb::arg("cta_k"), nb::arg("sm_scale"),
           nb::arg("output_dtype_code"), nb::arg("stream_ptr"), nb::arg("attn_mask") = nb::none());
+    m.def("bf16_sdpa_hip", &bf16_sdpa_hip,
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("output"),
+          nb::arg("sm_scale"), nb::arg("stream_ptr"));
+    m.def("hip_int8_attention", &hip_int8_attention,
+          nb::arg("q"), nb::arg("k"), nb::arg("v"), nb::arg("output"),
+          nb::arg("q_int8"), nb::arg("k_int8"), nb::arg("v_int8"),
+          nb::arg("q_descale"), nb::arg("k_descale"), nb::arg("v_descale"),
+          nb::arg("anchor_indices"), nb::arg("sm_scale"), nb::arg("stream_ptr"));
     m.def("adaln", &adaln);
     m.def("rms_adaln", &rms_adaln);
     m.def("group_norm_silu_pad3d", &group_norm_silu_pad3d, nb::arg("x"), nb::arg("weight").none(),

@@ -73,6 +73,10 @@ __all__ = [
     "flash_attention_decode_is_available",
     "na2d",
     "na3d",
+    "hip_attention",
+    "hip_attention_is_supported",
+    "hip_int8_attention",
+    "hip_int8_attention_is_supported",
     "sol_attn",
     "sol_attn_chunked",
     "sol_attn_is_available",
@@ -140,6 +144,76 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+
+def hip_attention_is_supported(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> bool:
+    """Return whether the BF16 HIP kernel is the recommended route for this call.
+
+    A routing hint, not an acceptance test: :func:`hip_attention` also runs
+    some calls reported False (e.g. GQA). False without gfx12-class WMMA or
+    when an input requires grad.
+    """
+    return (
+        bool(getattr(torch.version, "hip", None))
+        and registry.is_available("hip")
+        and _hip_backend.hip_attention_is_supported(q, k, v)
+    )
+
+
+def hip_int8_attention_is_supported(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> bool:
+    """Return whether :func:`hip_int8_attention` is the recommended route for this call.
+
+    A routing hint; short and batched calls follow
+    :func:`hip_attention_is_supported`.
+    """
+    return (
+        bool(getattr(torch.version, "hip", None))
+        and registry.is_available("hip")
+        and _hip_backend.hip_int8_attention_is_supported(q, k, v)
+    )
+
+
+def hip_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Forward-only unmasked BF16 HIP attention over [B, H, N, 128] tensors.
+
+    K/V may have fewer heads than Q (GQA). ``scale`` defaults to
+    ``head_dim ** -0.5``. Raises RuntimeError without gfx12-class WMMA or
+    when an input requires grad.
+    """
+    if not (
+        bool(getattr(torch.version, "hip", None)) and registry.is_available("hip")
+    ):
+        raise RuntimeError("HIP attention requires the HIP backend")
+    return _hip_backend.hip_attention(q, k, v, scale)
+
+
+def hip_int8_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """Forward-only unmasked HIP attention with INT8 Q/K/V for long calls.
+
+    Batch-one FP16/BF16 calls with at least 1024 queries run in INT8; shorter
+    and batched calls run :func:`hip_attention` (BF16 only). ``scale`` defaults
+    to ``head_dim ** -0.5``. Raises RuntimeError without gfx12-class WMMA or
+    when an input requires grad.
+    """
+    if not (
+        bool(getattr(torch.version, "hip", None)) and registry.is_available("hip")
+    ):
+        raise RuntimeError("INT8 HIP attention requires the HIP backend")
+    return _hip_backend.hip_int8_attention(q, k, v, scale)
 
 
 def sol_attn(

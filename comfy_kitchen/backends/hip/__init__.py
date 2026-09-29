@@ -17,6 +17,7 @@ import functools
 import importlib.util
 import json
 import logging
+import math
 import os
 import pathlib
 import sys
@@ -172,8 +173,8 @@ def _visible_gfx_arches() -> tuple[str | None, ...]:
     return tuple(_gfx_arch(i) for i in range(torch.cuda.device_count()))
 
 
-# RDNA2 has no matrix cores; RDNA3/3.5 and RDNA4 do. This exact manifest is also
-# consumed by setup.py and CMake. Never infer support from a gfx prefix: a new
+# RDNA2 has no matrix cores; RDNA3/3.5, gfx117x and RDNA4 do. This exact manifest
+# is also consumed by setup.py and CMake. Never infer support from a gfx prefix: a new
 # compiler-recognized target needs its WMMA policy reviewed before it is safe.
 _ARCH_MANIFEST_PATH = os.path.join(os.path.dirname(__file__), "architectures.json")
 _ARCH_GROUPS = json.loads(
@@ -181,9 +182,15 @@ _ARCH_GROUPS = json.loads(
 )
 _ARCH_ELEMENTWISE_ONLY = frozenset(_ARCH_GROUPS["elementwise_only"])
 _ARCH_WMMA_GFX11 = frozenset(_ARCH_GROUPS["wmma_gfx11"])
+_ARCH_WMMA_GFX117 = frozenset(_ARCH_GROUPS.get("wmma_gfx117", []))
 _ARCH_WMMA_GFX12 = frozenset(_ARCH_GROUPS["wmma_gfx12"])
-_ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX12
+_ARCH_WMMA = _ARCH_WMMA_GFX11 | _ARCH_WMMA_GFX117 | _ARCH_WMMA_GFX12
 _ARCH_SUPPORTED = _ARCH_ELEMENTWISE_ONLY | _ARCH_WMMA
+
+def _has_nonduplicated_wmma(device: torch.device | int | None = None) -> bool:
+    """Whether WMMA operands use the gfx12 128-bit layout."""
+    return _gfx_arch(device) in (_ARCH_WMMA_GFX12 | _ARCH_WMMA_GFX117)
+
 
 # The GEMMs, and only the GEMMs, need matrix cores. Everything else is elementwise
 # or a scalar reduction and runs on any supported architecture. This set names the
@@ -1540,6 +1547,177 @@ def na3d(
         _stream(q),
     )
     return out
+
+
+def _attention_device_is_supported(tensor: torch.Tensor) -> bool:
+    return bool(tensor.is_cuda and _has_nonduplicated_wmma(tensor.device))
+
+
+def _attention_layout_is_supported(tensor: torch.Tensor) -> bool:
+    return (
+        tensor.stride(3) == 1
+        and tensor.stride(2) % 8 == 0
+        and all(
+            tensor.shape[dim] <= 1 or tensor.stride(dim) % 8 == 0
+            for dim in (0, 1)
+        )
+        and tensor.data_ptr() % 16 == 0
+    )
+
+
+def _attention_inputs_are_supported(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+) -> bool:
+    if not _attention_device_is_supported(q):
+        return False
+    # The kernels are forward-only.
+    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
+        return False
+    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
+        return False
+    q_shape, k_shape, v_shape = q.shape, k.shape, v.shape
+    dtype = q.dtype
+    if not (
+        dtype == k.dtype == v.dtype
+        and dtype in (torch.float16, torch.bfloat16)
+        and q.device == k.device == v.device
+        and q_shape[0] == k_shape[0] == v_shape[0] > 0
+        and q_shape[1] == k_shape[1] == v_shape[1] > 0
+        and q_shape[2] > 0
+        and k_shape[2] == v_shape[2] > 0
+        and q_shape[3] == k_shape[3] == v_shape[3] == 128
+        and all(_attention_layout_is_supported(tensor) for tensor in (q, k, v))
+    ):
+        return False
+    long = q_shape[0] == 1 and q_shape[2] >= 1024
+    if dtype != torch.bfloat16 or q_shape[2] != k_shape[2]:
+        return long
+    # Recommended where the kernel beats SDPA: batch one with >=128 queries, or
+    # many batches of <=16 queries.
+    batch_one_short = q_shape[0] == 1 and 128 <= q_shape[2] < 1024
+    # Batches map to grid.z (max 65535).
+    batched_short = (
+        1 < q_shape[0] <= 65535
+        and q_shape[2] <= 16
+        and q_shape[0] * q_shape[1] >= 1024
+    )
+    return long or batch_one_short or batched_short
+
+
+def hip_attention_is_supported(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> bool:
+    if not _attention_inputs_are_supported(q, k, v):
+        return False
+    return q.dtype is torch.bfloat16
+
+
+def hip_int8_attention_is_supported(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> bool:
+    # Short and batched calls run the BF16 kernel; FP16 is INT8-path only.
+    return _attention_inputs_are_supported(q, k, v)
+
+
+def _check_attention_call(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+    if torch.is_grad_enabled() and (q.requires_grad or k.requires_grad or v.requires_grad):
+        raise RuntimeError(
+            "HIP attention is forward-only; run it under torch.no_grad() or "
+            "with inputs that do not require grad"
+        )
+    if not _has_nonduplicated_wmma(q.device):
+        raise RuntimeError("HIP attention requires a gfx12-class (gfx12/gfx117) device")
+
+
+def _attention_scale(q: torch.Tensor, scale: float | None) -> float:
+    scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
+    if not math.isfinite(scale):
+        raise ValueError(f"scale must be finite, got {scale}")
+    return scale
+
+
+def _attention_output(q: torch.Tensor) -> torch.Tensor:
+    # [B, N, H, D] storage viewed as [B, H, N, D], like SDPA output.
+    return torch.empty(
+        (q.shape[0], q.shape[2], q.shape[1], q.shape[3]),
+        device=q.device,
+        dtype=q.dtype,
+    ).movedim(1, 2)
+
+
+def _bf16_attention(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
+) -> torch.Tensor:
+    if q.dtype is not torch.bfloat16:
+        raise RuntimeError("HIP native attention is BF16")
+    output = _attention_output(q)
+    # The binding uses the current device; pin it to q's.
+    with torch.cuda.device(q.device):
+        _C.bf16_sdpa_hip(_dl(q), _dl(k), _dl(v), _dl(output), scale, _stream(q))
+    return output
+
+
+def hip_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """HIP BF16 attention for unmasked D=128 calls on gfx12-class devices.
+
+    ``hip_attention_is_supported`` reports the shapes where this beats SDPA.
+    """
+    scale = _attention_scale(q, scale)
+    _check_attention_call(q, k, v)
+    return _bf16_attention(q, k, v, scale)
+
+
+def _int8_attention_workspace(reference: torch.Tensor, q_len: int, kv_len: int):
+    heads = int(reference.shape[1])
+    padded_q = -(-q_len // 128) * 128
+    padded_k = -(-kv_len // 64) * 64
+    tiles = padded_k // 64
+    tensor = functools.partial(torch.empty, device=reference.device)
+    return (
+        tensor((1, heads, q_len, 128), dtype=torch.int8),
+        tensor((1, heads, padded_k, 128), dtype=torch.int8),
+        tensor((1, heads, tiles, 128, 64), dtype=torch.int8),
+        tensor((heads, padded_q), dtype=torch.float32),
+        tensor((heads, padded_k // 16), dtype=torch.float32),
+        tensor((heads, tiles, 128), dtype=torch.float32),
+        tensor((1, heads), dtype=torch.int32),
+    )
+
+
+def hip_int8_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: float | None = None,
+) -> torch.Tensor:
+    """INT8 attention for long batch-one calls; BF16 kernel otherwise."""
+    scale = _attention_scale(q, scale)
+    _check_attention_call(q, k, v)
+    # Short (<1024 queries) and batched calls are overhead-bound; use BF16.
+    if q.shape[0] > 1 or q.shape[2] < 1024:
+        return _bf16_attention(q, k, v, scale)
+    q_len = int(q.shape[2])
+    kv_len = int(k.shape[2])
+    output = _attention_output(q)
+    workspaces = _int8_attention_workspace(q, q_len, kv_len)
+    with torch.cuda.device(q.device):
+        _C.hip_int8_attention(
+            _dl(q),
+            _dl(k),
+            _dl(v),
+            _dl(output),
+            *(_dl(tensor) for tensor in workspaces),
+            scale,
+            _stream(q),
+        )
+    return output
 
 
 def _adaln_impl(kernel, x, scale, shift, eps) -> torch.Tensor:
